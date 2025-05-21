@@ -88,7 +88,7 @@ LOG_MODULE_REGISTER(paw32xx, CONFIG_PAW32XX_LOG_LEVEL);
 #define PAW32XX_DELTA_Y(xy_high, y_low)	expand_s12((((xy_high) & 0x0F) << 8) | (y_low))
 
 /* Sensor identification values */
-//#define PAW32XX_PRODUCT_ID		0x30  //paw32xx 
+//#define PAW32XX_PRODUCT_ID		0x30  //paw3212 
 #define PAW32XX_PRODUCT_ID		0x61    //fct3065
 
 /* Write protect magic */
@@ -415,8 +415,6 @@ static int toggle_sleep_modes(const struct device *dev, uint8_t reg_addr1,
 			      uint8_t reg_addr2, bool enable)
 { 
 
-	LOG_WRN("toggle_sleep_modes AAAAAA");
-
 	int err = reg_write(dev, PAW32XX_REG_WRITE_PROTECT,
 			    PAW32XX_WPMAGIC);
 	if (err) {
@@ -493,13 +491,10 @@ static void set_interrupt(const struct device *dev, const bool en) {
 static void irq_handler(const struct device *gpiob, struct gpio_callback *cb,
 			uint32_t pins)
 {
-	//LOG_WRN("IRQ Handler AAAAAA");
-
 	struct paw32xx_data *data = CONTAINER_OF(cb, struct paw32xx_data,
 						 irq_gpio_cb);
 	const struct device *dev = data->dev;
 
-	//위에 주석처리하고 irq 인터럽트 함수로 넣어줌
 	set_interrupt(dev, false);
 	
 	k_work_submit(&data->trigger_handler_work);
@@ -507,12 +502,10 @@ static void irq_handler(const struct device *gpiob, struct gpio_callback *cb,
 
 static void trigger_handler(struct k_work *work)
 {
-	//LOG_WRN("Trigger Handler AAAAAA");
 	struct paw32xx_data *data = CONTAINER_OF(work, struct paw32xx_data,
 						 trigger_handler_work);
 	const struct device *dev = data->dev;
 	
-	//추가해 주고 아래는 주석처리함 있으면 다운됨 
 	enum sensor_channel chan;
 	chan =  SENSOR_CHAN_ALL;
 	paw32xx_sample_fetch(dev,chan);
@@ -633,7 +626,6 @@ static int paw32xx_init(const struct device *dev)
 	struct paw32xx_data *data = dev->data;
 	const struct paw32xx_config *config = dev->config;
 	int err;
-	LOG_INF("PAW32XX init  AAA");
 
 	/* Assert that negative numbers are processed as expected */
 	__ASSERT_NO_MSG(-1 == expand_s12(0xFFF));
@@ -743,11 +735,6 @@ static int paw32xx_sample_fetch(const struct device *dev, enum sensor_channel ch
 		} else {
 			data->x = (int8_t)x_low ;
 			data->y = (int8_t)y_low ;
-			// LOG_WRN("delta x : %d",x_low);
-			// LOG_WRN("data->x : %d",data->x);
-			// LOG_WRN("delta y : %d",y_low);
-			// LOG_WRN("data->y : %d",data->y);
-			// LOG_WRN("x/y: %d / %d", data->x, data->y);
 		}
 	} else {
 		data->x = 0;
@@ -785,9 +772,6 @@ static int paw32xx_sample_fetch(const struct device *dev, enum sensor_channel ch
 		}
 #endif
 
-		//fetch report value pmw3610 보고 추가함 있어야 마우스 움직이나 빠른 움직임에서 딜레이로 멈춰버림림
-		// int16_t rx = dx*.5;
-		// int16_t ry = dy*.5;
 		int16_t rx = (int16_t)CLAMP(dx , INT16_MIN, INT16_MAX) * .5;
 		int16_t ry = (int16_t)CLAMP(dy , INT16_MIN, INT16_MAX) * .5;
 		bool have_x = rx != 0;
@@ -815,7 +799,6 @@ static int paw32xx_sample_fetch(const struct device *dev, enum sensor_channel ch
 			// }
 		}
 	}
-	//LOG_INF("PAW32XX sample fetch AAA");
 	return err;
 }
 
