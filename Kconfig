@@ -1,0 +1,82 @@
+# PAW32XX optical motion sensor
+#
+# Copyright (c) 2019 Nordic Semiconductor
+#
+# SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
+#
+
+menuconfig PAW32XX
+	bool "PAW32XX mouse optical sensor"
+  select SPI
+  depends on INPUT
+  depends on DT_HAS_PIXART_PAW32XX_ENABLED
+	help
+	  Enable PAW32XX mouse optical sensor.
+
+if PAW32XX
+
+choice
+	prompt "Select PAW32XX sensor orientation"
+	default PAW32XX_ORIENTATION_0
+
+config PAW32XX_ORIENTATION_0
+	bool "PAW32XX not rotated"
+
+config PAW32XX_ORIENTATION_90
+	bool "PAW32XX rotated 90 deg clockwise"
+
+config PAW32XX_ORIENTATION_180
+	bool "PAW32XX rotated 180 deg clockwise"
+
+config PAW32XX_ORIENTATION_270
+	bool "PAW32XX rotated 270 deg clockwise"
+
+endchoice
+
+choice
+	prompt "Select PAW32XX sensor motion data length"
+	default PAW32XX_8_BIT_MODE
+
+config PAW32XX_8_BIT_MODE
+	bool "PAW32XX 8-bit motion data length"
+
+config PAW32XX_12_BIT_MODE
+	bool "PAW32XX 12-bit motion data length"
+
+endchoice
+
+config PAW32XX_REPORT_INTERVAL_MIN
+	int "PAW32XX_REPORT_INTERVAL_MIN"
+	default  1
+
+#config PAW32XX_ATTR_CPI
+#	int "paw32xx cpi"
+#	default  27
+
+# config PAW32XX_ATR_SLEEP_ENABLE
+# 	bool "PAW32XX_ATR_SLEEP_ENABLE"
+
+# config PAW32XX_ATTR_SLEEP1_TIMEOUT
+# 	int "PAW32XX_ATTR_SLEEP1_TIMEOUT"
+
+# config PAW32XX_ATTR_SLEEP2_TIMEOUT
+# 	int "PAW32XX_ATTR_SLEEP2_TIMEOUT"
+
+# config PAW32XX_ATTR_SLEEP3_TIMEOUT
+# 	int "PAW32XX_ATTR_SLEEP3_TIMEOUT"
+
+# config PAW32XX_ATTR_SLEEP1_SAMPLE_TIME
+# 	int "PAW32XX_ATTR_SLEEP1_SAMPLE_TIME"
+
+# config PAW32XX_ATTR_SLEEP2_SAMPLE_TIME
+# 	int "PAW32XX_ATTR_SLEEP2_SAMPLE_TIME"
+
+# config PAW32XX_ATTR_SLEEP3_SAMPLE_TIME
+# 	int "PAW32XX_ATTR_SLEEP3_SAMPLE_TIME"
+
+
+module = PAW32XX
+module-str = PAW32XX
+source "${ZEPHYR_BASE}/subsys/logging/Kconfig.template.log_config"
+
+endif #PAW32XX

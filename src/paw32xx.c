@@ -1,0 +1,1167 @@
+/*
+ * Copyright (c) 2019-2022 Nordic Semiconductor ASA
+ *
+ * SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
+ */
+
+#define DT_DRV_COMPAT pixart_paw32xx
+
+#include <zephyr/kernel.h>
+#include <zephyr/drivers/sensor.h>
+#include <zephyr/input/input.h>
+#include <zephyr/device.h>
+#include <zephyr/drivers/spi.h>
+#include <zephyr/drivers/gpio.h>
+#include <zephyr/sys/byteorder.h>
+#include <zmk/keymap.h>
+#include <zmk/events/activity_state_changed.h>
+#include "paw32xx.h"
+#include <zmk/events/usb_conn_state_changed.h>
+
+#include <zephyr/logging/log.h>
+LOG_MODULE_REGISTER(paw32xx, CONFIG_PAW32XX_LOG_LEVEL);
+
+/* Timings defined by spec */
+#define T_NCS_SCLK	1			/* 120 ns */
+#define T_SRX		(20 - T_NCS_SCLK)	/* 20 us */
+#define T_SCLK_NCS_WR	(35 - T_NCS_SCLK)	/* 35 us */
+#define T_SWX		(180 - T_SCLK_NCS_WR)	/* 180 us */
+#define T_SRAD		160			/* 160 us */
+
+
+/* Sensor registers */
+#define PAW32XX_REG_PRODUCT_ID		0x00
+#define PAW32XX_REG_REVISION_ID		0x01
+#define PAW32XX_REG_MOTION				0x02
+#define PAW32XX_REG_DELTA_X_LOW		0x03
+#define PAW32XX_REG_DELTA_Y_LOW		0x04
+#define PAW32XX_REG_OPERATION_MODE	0x05
+#define PAW32XX_REG_CONFIGURATION	0x06
+#define PAW32XX_REG_WRITE_PROTECT	0x09
+#define PAW32XX_REG_DELTA_XY_HIGH	0x12
+#define PAW32XX_REG_MOUSE_OPTION		0x19
+#define PAW32XX_REG_SLEEP1				0x0A
+#define PAW32XX_REG_SLEEP2				0x0B
+#define PAW32XX_REG_SLEEP3				0x0C
+#define PAW32XX_REG_CPI_X				0x0D
+#define PAW32XX_REG_CPI_Y				0x0E
+
+/* CPI */
+#define PAW32XX_CPI_STEP		38u
+#define PAW32XX_CPI_MIN			(0x00 * PAW32XX_CPI_STEP)
+#define PAW32XX_CPI_MAX			(0x3F * PAW32XX_CPI_STEP)
+
+/* Sleep */
+#define PAW32XX_SLP_ENH_POS		4u
+#define PAW32XX_SLP2_ENH_POS		3u
+#define PAW32XX_SLP3_ENH_POS		5u
+
+#define PAW32XX_ETM_POS			0u
+#define PAW32XX_ETM_SIZE		4u
+#define PAW32XX_FREQ_POS		(PAW32XX_ETM_POS + PAW32XX_ETM_SIZE)
+#define PAW32XX_FREQ_SIZE		4u
+
+#define PAW32XX_ETM_MIN			0u
+#define PAW32XX_ETM_MAX			BIT_MASK(PAW32XX_ETM_SIZE)
+#define PAW32XX_ETM_MASK		(PAW32XX_ETM_MAX << PAW32XX_ETM_POS)
+
+#define PAW32XX_FREQ_MIN		0u
+#define PAW32XX_FREQ_MAX		BIT_MASK(PAW32XX_FREQ_SIZE)
+#define PAW32XX_FREQ_MASK		(PAW32XX_FREQ_MAX << PAW32XX_FREQ_POS)
+
+/* Motion status bits */
+#define PAW32XX_MOTION_STATUS_MOTION	BIT(7)
+#define PAW32XX_MOTION_STATUS_DYOVF	BIT(4)
+#define PAW32XX_MOTION_STATUS_DXOVF	BIT(3)
+
+/* Configuration bits */
+#define PAW32XX_CONFIG_CHIP_RESET	BIT(7)
+
+/* Mouse option bits */
+#define PAW32XX_MOUSE_OPT_XY_SWAP	BIT(5)
+#define PAW32XX_MOUSE_OPT_Y_INV		BIT(4)
+#define PAW32XX_MOUSE_OPT_X_INV		BIT(3)
+#define PAW32XX_MOUSE_OPT_12BITMODE	BIT(2)
+
+/* Convert deltas to x and y */
+#define PAW32XX_DELTA_X(xy_high, x_low)	expand_s12((((xy_high) & 0xF0) << 4) | (x_low))
+#define PAW32XX_DELTA_Y(xy_high, y_low)	expand_s12((((xy_high) & 0x0F) << 8) | (y_low))
+
+/* Sensor identification values */
+#define PAW32XX_PRODUCT_ID		0x30  //paw32xx 
+//#define PAW32XX_PRODUCT_ID		0x61    //fct3065
+
+/* Write protect magic */
+#define PAW32XX_WPMAGIC			0x5A
+
+#define SPI_WRITE_BIT			BIT(7)
+
+/* Helper macros used to convert sensor values. */
+#define PAW32XX_SVALUE_TO_CPI(svalue) ((uint32_t)(svalue).val1)
+#define PAW32XX_SVALUE_TO_TIME(svalue) ((uint32_t)(svalue).val1)
+#define PAW32XX_SVALUE_TO_BOOL(svalue) ((svalue).val1 != 0)
+
+enum async_init_step {
+	ASYNC_INIT_STEP_POWER_UP,
+	ASYNC_INIT_STEP_VERIFY_ID,
+	ASYNC_INIT_STEP_CONFIGURE,
+
+	ASYNC_INIT_STEP_COUNT
+};
+
+struct paw32xx_data {
+	const struct device          *dev;
+	struct gpio_callback         irq_gpio_cb;
+	struct k_spinlock            lock;
+	int16_t                      x;
+	int16_t                      y;
+	sensor_trigger_handler_t     data_ready_handler;
+	struct k_work                trigger_handler_work;
+	struct k_work_delayable      init_work;
+	enum async_init_step         async_init_step;
+	int                          err;
+	bool                         ready;
+};
+
+struct paw32xx_config {
+	struct gpio_dt_spec irq_gpio;
+	struct spi_dt_spec bus;
+	struct gpio_dt_spec cs_gpio;
+    uint16_t cpi;
+    uint8_t evt_type;
+    uint8_t x_input_code;
+    uint8_t y_input_code;
+    bool force_awake;
+};
+
+static const int32_t async_init_delay[ASYNC_INIT_STEP_COUNT] = {
+	[ASYNC_INIT_STEP_POWER_UP]  = 1,
+	[ASYNC_INIT_STEP_VERIFY_ID] = 0,
+	[ASYNC_INIT_STEP_CONFIGURE] = 0,
+};
+
+
+static int paw32xx_async_init_power_up(const struct device *dev);
+static int paw32xx_async_init_verify_id(const struct device *dev);
+static int paw32xx_async_init_configure(const struct device *dev);
+static int paw32xx_sample_fetch(const struct device *dev, enum sensor_channel chan);
+
+
+
+static int (* const async_init_fn[ASYNC_INIT_STEP_COUNT])(const struct device *dev) = {
+	[ASYNC_INIT_STEP_POWER_UP]  = paw32xx_async_init_power_up,
+	[ASYNC_INIT_STEP_VERIFY_ID] = paw32xx_async_init_verify_id,
+	[ASYNC_INIT_STEP_CONFIGURE] = paw32xx_async_init_configure,
+};
+
+static int16_t expand_s12(int16_t x)
+{
+	/* Left shifting of negative values is undefined behavior, so we cannot
+	 * depend on automatic integer promotion (it will convert int16_t to int).
+	 * To expand sign we cast s16 to unsigned int and left shift it then
+	 * cast it to signed integer and do the right shift. Since type is
+	 * signed compiler will perform arithmetic shift. This last operation
+	 * is implementation defined in C but defined in the compiler's
+	 * documentation and common for modern compilers and CPUs.
+	 */
+	return ((signed int)((unsigned int)x << 20)) >> 20;
+}
+
+static int spi_cs_ctrl(const struct device *dev, bool enable)
+{
+	const struct paw32xx_config *config = dev->config;
+	int err;
+
+	if (!enable) {
+		k_busy_wait(T_NCS_SCLK);
+	}
+
+	err = gpio_pin_set_dt(&config->cs_gpio, (int)enable);
+
+	if (err) {
+		LOG_ERR("SPI CS ctrl failed");
+	}
+
+	if (enable) {
+		k_busy_wait(T_NCS_SCLK);
+	}
+
+	return err;
+}
+
+static int reg_read(const struct device *dev, uint8_t reg, uint8_t *buf)
+{
+	int err;
+	const struct paw32xx_config *config = dev->config;
+
+	__ASSERT_NO_MSG((reg & SPI_WRITE_BIT) == 0);
+
+	err = spi_cs_ctrl(dev, true);
+	if (err) {  return err;  }
+
+	/* Write register address. */
+	const struct spi_buf 	 tx_buf = { .buf = &reg,  .len  = 1  };
+	const struct spi_buf_set tx 	  = {	.buffers = &tx_buf, .count = 1	};
+
+	err = spi_write_dt(&config->bus, &tx);
+	if (err) {  LOG_ERR("Reg read failed on SPI write");  return err; }
+
+	k_busy_wait(T_SRAD);
+
+	/* Read register value. */
+	struct spi_buf rx_buf = { .buf = buf, .len = 1, };
+	const struct spi_buf_set rx = {  .buffers = &rx_buf,  .count = 1, };
+
+	err = spi_read_dt(&config->bus, &rx);
+	if (err) {  LOG_ERR("Reg read failed on SPI read");  return err;  }
+
+	err = spi_cs_ctrl(dev, false);
+	if (err) {  return err; }
+
+	k_busy_wait(T_SRX);
+
+	return 0;
+}
+
+static int reg_write(const struct device *dev, uint8_t reg, uint8_t val)
+{
+	int err;
+	const struct paw32xx_config *config = dev->config;
+
+	__ASSERT_NO_MSG((reg & SPI_WRITE_BIT) == 0);
+
+	err = spi_cs_ctrl(dev, true);
+	if (err) {
+		return err;
+	}
+
+	uint8_t buf[] = {
+		SPI_WRITE_BIT | reg,
+		val
+	};
+	const struct spi_buf tx_buf = {
+		.buf = buf,
+		.len = ARRAY_SIZE(buf)
+	};
+	const struct spi_buf_set tx = {
+		.buffers = &tx_buf,
+		.count = 1
+	};
+
+	err = spi_write_dt(&config->bus, &tx);
+	if (err) {
+		LOG_ERR("Reg write failed on SPI write");
+		return err;
+	}
+
+	k_busy_wait(T_SCLK_NCS_WR);
+
+	err = spi_cs_ctrl(dev, false);
+	if (err) {
+		return err;
+	}
+
+	k_busy_wait(T_SWX);
+
+	return 0;
+}
+
+static int update_cpi(const struct device *dev, uint32_t cpi)
+{
+	//LOG_WRN("update_cpi AAAAAA");
+	int err;
+	if ((cpi > PAW32XX_CPI_MAX) || (cpi < PAW32XX_CPI_MIN)) {
+		LOG_ERR("CPI %" PRIu32 " out of range", cpi);
+		return -EINVAL;
+	}
+
+	uint8_t regval = cpi / PAW32XX_CPI_STEP;
+
+	LOG_WRN("Set CPI: %u (requested: %u, reg:0x%" PRIx8 ")",
+		regval * PAW32XX_CPI_STEP, cpi, regval);
+
+	err = reg_write(dev, PAW32XX_REG_WRITE_PROTECT, PAW32XX_WPMAGIC);
+	if (err) {
+		LOG_ERR("Cannot disable write protect");
+		return err;
+	}
+
+	err = reg_write(dev, PAW32XX_REG_CPI_X, regval);
+	if (err) {
+		LOG_ERR("Failed to change x CPI");
+		return err;
+	}
+
+	err = reg_write(dev, PAW32XX_REG_CPI_Y, regval);
+	if (err) {
+		LOG_ERR("Failed to change y CPI");
+		return err;
+	}
+
+	err = reg_write(dev, PAW32XX_REG_WRITE_PROTECT, 0);
+	if (err) {
+		LOG_ERR("Cannot enable write protect");
+	}
+
+	return err;
+}
+
+static int update_sleep_timeout(const struct device *dev, uint8_t reg_addr,
+				uint32_t timeout_ms)
+{
+	//LOG_WRN("update_sleep_timeout AAAAAA");
+	uint32_t timeout_step_ms;
+	switch (reg_addr) {
+	case PAW32XX_REG_SLEEP1:
+		timeout_step_ms = 32;
+		break;
+
+	case PAW32XX_REG_SLEEP2:
+	case PAW32XX_REG_SLEEP3:
+		timeout_step_ms = 20480;
+		break;
+
+	default:
+		LOG_ERR("Not supported");
+		return -ENOTSUP;
+	}
+
+	uint32_t etm = timeout_ms / timeout_step_ms - 1;
+
+	if ((etm < PAW32XX_ETM_MIN) || (etm > PAW32XX_ETM_MAX)) {
+		LOG_WRN("Sleep timeout %" PRIu32 " out of range", timeout_ms);
+		return -EINVAL;
+	}
+
+	LOG_DBG("Set sleep%d timeout: %u (requested: %u, reg:0x%" PRIx8 ")",
+		reg_addr - PAW32XX_REG_SLEEP1 + 1,
+		(etm + 1) * timeout_step_ms,
+		timeout_ms,
+		etm);
+
+	int err;
+
+	err = reg_write(dev, PAW32XX_REG_WRITE_PROTECT, PAW32XX_WPMAGIC);
+	if (err) {
+		LOG_ERR("Cannot disable write protect");
+		return err;
+	}
+
+	uint8_t regval;
+
+	err = reg_read(dev, reg_addr, &regval);
+	if (err) {
+		LOG_ERR("Failed to read sleep register");
+		return err;
+	}
+
+	__ASSERT_NO_MSG((etm & PAW32XX_ETM_MASK) == etm);
+
+	regval &= ~PAW32XX_ETM_MASK;
+	regval |= (etm << PAW32XX_ETM_POS);
+
+	err = reg_write(dev, reg_addr, regval);
+	if (err) {
+		LOG_ERR("Failed to change sleep time");
+		return err;
+	}
+
+	err = reg_write(dev, PAW32XX_REG_WRITE_PROTECT, 0);
+	if (err) {
+		LOG_ERR("Cannot enable write protect");
+	}
+
+	return err;
+}
+
+static int update_sample_time(const struct device *dev, uint8_t reg_addr,
+			      uint32_t sample_time_ms)
+{
+
+		LOG_WRN("update_sample_time AAAAAA");
+
+	uint32_t sample_time_step;
+	uint32_t sample_time_min;
+	uint32_t sample_time_max;
+
+	switch (reg_addr) {
+	case PAW32XX_REG_SLEEP1:
+		sample_time_step = 4;
+		sample_time_min = 4;
+		sample_time_max = 64;
+		break;
+
+	case PAW32XX_REG_SLEEP2:
+	case PAW32XX_REG_SLEEP3:
+		sample_time_step = 64;
+		sample_time_min = 64;
+		sample_time_max = 1024;
+		break;
+
+	default:
+		LOG_ERR("Not supported");
+		return -ENOTSUP;
+	}
+
+	if ((sample_time_ms > sample_time_max) ||
+	    (sample_time_ms < sample_time_min))	{
+		LOG_WRN("Sample time %" PRIu32 " out of range", sample_time_ms);
+		return -EINVAL;
+	}
+
+	uint8_t reg_freq = (sample_time_ms - sample_time_min) / sample_time_step;
+
+	LOG_DBG("Set sleep%d sample time: %u (requested: %u, reg:0x%" PRIx8 ")",
+		reg_addr - PAW32XX_REG_SLEEP1 + 1,
+		(reg_freq * sample_time_step) + sample_time_min,
+		sample_time_ms,
+		reg_freq);
+
+	__ASSERT_NO_MSG(reg_freq <= PAW32XX_FREQ_MAX);
+
+	int err;
+
+	err = reg_write(dev, PAW32XX_REG_WRITE_PROTECT, PAW32XX_WPMAGIC);
+	if (err) {
+		LOG_ERR("Cannot disable write protect");
+		return err;
+	}
+
+	uint8_t regval;
+
+	err = reg_read(dev, reg_addr, &regval);
+	if (err) {
+		LOG_ERR("Failed to read sleep register");
+		return err;
+	}
+
+	regval &= ~PAW32XX_FREQ_MASK;
+	regval |= (reg_freq << PAW32XX_FREQ_POS);
+
+	err = reg_write(dev, reg_addr, regval);
+	if (err) {
+		LOG_ERR("Failed to change sample time");
+		return err;
+	}
+
+	err = reg_write(dev, PAW32XX_REG_WRITE_PROTECT, 0);
+	if (err) {
+		LOG_ERR("Cannot enable write protect");
+	}
+
+	return err;
+}
+
+static int toggle_sleep_modes(const struct device *dev, uint8_t reg_addr1,
+			      uint8_t reg_addr2, bool enable)
+{ 
+
+	LOG_WRN("toggle_sleep_modes AAAAAA");
+
+	int err = reg_write(dev, PAW32XX_REG_WRITE_PROTECT,
+			    PAW32XX_WPMAGIC);
+	if (err) {
+		LOG_ERR("Cannot disable write protect");
+		return err;
+	}
+
+	uint8_t regval;
+
+	LOG_DBG("%sable sleep", (enable) ? ("En") : ("Dis"));
+
+	/* Sleep 1 and Sleep 2 */
+	err = reg_read(dev, reg_addr1, &regval);
+	if (err) {
+		LOG_ERR("Failed to read operation mode register");
+		return err;
+	}
+
+	uint8_t sleep_enable_mask = BIT(PAW32XX_SLP_ENH_POS) |
+				 BIT(PAW32XX_SLP2_ENH_POS);
+
+	if (enable) {
+		regval |= sleep_enable_mask;
+	} else {
+		regval &= ~sleep_enable_mask;
+	}
+
+	err = reg_write(dev, reg_addr1, regval);
+	if (err) {
+		LOG_ERR("Failed to %sable sleep", (enable) ? ("en") : ("dis"));
+		return err;
+	}
+
+	/* Sleep 3 */
+	err = reg_read(dev, reg_addr2, &regval);
+	if (err) {
+		LOG_ERR("Failed to read configuration register");
+		return err;
+	}
+
+	sleep_enable_mask = BIT(PAW32XX_SLP3_ENH_POS);
+
+	if (enable) {
+		regval |= sleep_enable_mask;
+	} else {
+		regval &= ~sleep_enable_mask;
+	}
+
+	err = reg_write(dev, reg_addr2, regval);
+	if (err) {
+		LOG_ERR("Failed to %sable sleep", (enable) ? ("en") : ("dis"));
+		return err;
+	}
+
+	err = reg_write(dev, PAW32XX_REG_WRITE_PROTECT, 0);
+	if (err) {
+		LOG_ERR("Cannot enable write protect");
+	}
+
+	return err;
+}
+
+
+static void set_interrupt(const struct device *dev, const bool en) {
+    const struct paw32xx_config *config = dev->config;
+    int ret = gpio_pin_interrupt_configure_dt(&config->irq_gpio,
+                                              en ? GPIO_INT_LEVEL_ACTIVE : GPIO_INT_DISABLE);
+    if (ret < 0) {
+        LOG_ERR("can't set interrupt");
+    }
+}
+
+
+static void irq_handler(const struct device *gpiob, struct gpio_callback *cb,
+			uint32_t pins)
+{
+	//LOG_WRN("IRQ Handler AAAAAA");
+	//int err;
+	struct paw32xx_data *data = CONTAINER_OF(cb, struct paw32xx_data,
+						 irq_gpio_cb);
+	const struct device *dev = data->dev;
+	//const struct paw32xx_config *config = dev->config;
+
+	// err = gpio_pin_interrupt_configure_dt(&config->irq_gpio,
+	// 				      	      GPIO_INT_LEVEL_ACTIVE);
+	// // err = gpio_pin_interrupt_configure_dt(&config->irq_gpio,
+	// // 				      GPIO_INT_DISABLE);
+	// if (unlikely(err)) {
+	// 	LOG_ERR("Cannot disable IRQ");
+	// 	k_panic();
+	// }
+ 
+	//위에 주석처리하고 irq 인터럽트 함수로 넣어줌
+	set_interrupt(dev, false);
+	
+	k_work_submit(&data->trigger_handler_work);
+}
+
+static void trigger_handler(struct k_work *work)
+{
+	//LOG_WRN("Trigger Handler AAAAAA");
+
+	//sensor_trigger_handler_t handler;
+	//int err = 0;
+	struct paw32xx_data *data = CONTAINER_OF(work, struct paw32xx_data,
+						 trigger_handler_work);
+	const struct device *dev = data->dev;
+	//const struct paw32xx_config *config = dev->config;
+	
+	//추가해 주고 아래는 주석처리함 있으면 다운됨 
+	enum sensor_channel chan;
+	chan =  SENSOR_CHAN_ALL;
+	paw32xx_sample_fetch(dev,chan);
+	set_interrupt(dev, true);
+
+   /*
+	// k_spinlock_key_t key = k_spin_lock(&data->lock);
+
+	// handler = data->data_ready_handler;
+	// k_spin_unlock(&data->lock, key);
+	// if (!handler) {
+	// 	return;
+	// }
+
+	// struct sensor_trigger trig = {
+	// 	.type = SENSOR_TRIG_DATA_READY,
+	// 	.chan = SENSOR_CHAN_ALL,
+	// };
+
+	// handler(dev, &trig);
+
+	// key = k_spin_lock(&data->lock);
+	// if (data->data_ready_handler) {
+	// 	err = gpio_pin_interrupt_configure_dt(&config->irq_gpio,
+	// 					      GPIO_INT_LEVEL_ACTIVE);
+	// 	LOG_WRN("Trigger Handler gpi interrupt config AAA");
+	// }
+	// k_spin_unlock(&data->lock, key);
+
+	// if (unlikely(err)) {
+	// 	LOG_ERR("Cannot re-enable IRQ");
+	// 	k_panic();
+	// }
+	*/
+}
+
+
+static int paw32xx_async_init_power_up(const struct device *dev)
+{
+			LOG_INF("Init Power up AAA");
+
+	return reg_write(dev, PAW32XX_REG_CONFIGURATION,
+			 PAW32XX_CONFIG_CHIP_RESET);
+}
+
+static int paw32xx_async_init_verify_id(const struct device *dev)
+{
+	int err;
+
+	uint8_t product_id;
+	err = reg_read(dev, PAW32XX_REG_PRODUCT_ID, &product_id);
+	if (err) {
+		LOG_ERR("Cannot obtain product ID");
+		return err;
+	}
+
+	LOG_DBG("Product ID: 0x%" PRIx8, product_id);
+	if (product_id != PAW32XX_PRODUCT_ID) {
+		LOG_ERR("Invalid product ID (0x%" PRIx8")!", product_id);
+		return -EIO;
+	}
+
+	return err;
+}
+
+static int paw32xx_async_init_configure(const struct device *dev)
+{
+	int err;
+
+	err = reg_write(dev, PAW32XX_REG_WRITE_PROTECT, PAW32XX_WPMAGIC);
+	if (!err) {
+		uint8_t mouse_option = 0;
+
+		if (IS_ENABLED(CONFIG_PAW32XX_ORIENTATION_90)) {
+			mouse_option |= PAW32XX_MOUSE_OPT_XY_SWAP |
+					PAW32XX_MOUSE_OPT_Y_INV;
+		} else if (IS_ENABLED(CONFIG_PAW32XX_ORIENTATION_180)) {
+			mouse_option |= PAW32XX_MOUSE_OPT_Y_INV |
+					PAW32XX_MOUSE_OPT_X_INV;
+		} else if (IS_ENABLED(CONFIG_PAW32XX_ORIENTATION_270)) {
+			mouse_option |= PAW32XX_MOUSE_OPT_XY_SWAP |
+					PAW32XX_MOUSE_OPT_X_INV;		}
+
+		if (IS_ENABLED(CONFIG_PAW32XX_12_BIT_MODE)) {
+			mouse_option |= PAW32XX_MOUSE_OPT_12BITMODE;
+		}
+
+		err = reg_write(dev, PAW32XX_REG_MOUSE_OPTION,
+				mouse_option);
+	}
+	if (!err) {
+		err = reg_write(dev, PAW32XX_REG_WRITE_PROTECT, 0);
+	}
+
+	return err;
+}
+
+static void paw32xx_async_init(struct k_work *work)
+{
+	struct paw32xx_data *data = CONTAINER_OF(work, struct paw32xx_data,
+						 init_work.work);
+	const struct device *dev = data->dev;
+
+	LOG_DBG("PAW32XX async init step %d", data->async_init_step);
+	//LOG_INF("paw32xx_async_init step %d", data->async_init_step);
+
+	data->err = async_init_fn[data->async_init_step](dev);
+	if (data->err) {
+		LOG_ERR("PAW32XX initialization failed");
+	} else {
+		data->async_init_step++;
+
+		if (data->async_init_step == ASYNC_INIT_STEP_COUNT) {
+			data->ready = true;
+			LOG_INF("PAW32XX initialized AAAAA");
+			set_interrupt(dev, true);
+		} else {
+			k_work_schedule(&data->init_work,
+					K_MSEC(async_init_delay[
+						data->async_init_step]));
+		}
+	}
+}
+
+
+static int paw32xx_init_irq(const struct device *dev)
+{
+	int err;
+	struct paw32xx_data *data = dev->data;
+	const struct paw32xx_config *config = dev->config;
+
+	if (!device_is_ready(config->irq_gpio.port)) {
+		LOG_ERR("IRQ GPIO device not ready");
+		return -ENODEV;
+	}
+
+	err = gpio_pin_configure_dt(&config->irq_gpio, GPIO_INPUT);
+	if (err) {
+		LOG_ERR("Cannot configure IRQ GPIO");
+		return err;
+	}
+
+	gpio_init_callback(&data->irq_gpio_cb, irq_handler,
+			   BIT(config->irq_gpio.pin));
+
+	err = gpio_add_callback(config->irq_gpio.port,
+				&data->irq_gpio_cb);
+
+	if (err) {
+		LOG_ERR("Cannot add IRQ GPIO callback");
+	}
+	
+	LOG_INF("paw32xx_init_irq  AAA 1");
+
+	return err;
+}
+
+static int paw32xx_init(const struct device *dev)
+{
+	struct paw32xx_data *data = dev->data;
+	const struct paw32xx_config *config = dev->config;
+	int err;
+	LOG_INF("PAW32XX init  AAA");
+
+	/* Assert that negative numbers are processed as expected */
+	__ASSERT_NO_MSG(-1 == expand_s12(0xFFF));
+
+	data->dev = dev;
+   
+	// init trigger handler work
+	k_work_init(&data->trigger_handler_work, trigger_handler);
+
+	if (!spi_is_ready_dt(&config->bus)) {
+		return -ENODEV;
+	}
+
+	if (!device_is_ready(config->cs_gpio.port)) {
+		LOG_ERR("SPI CS device not ready");
+		return -ENODEV;
+	}
+
+	err = gpio_pin_configure_dt(&config->cs_gpio, GPIO_OUTPUT_INACTIVE);
+	if (err) {
+		LOG_ERR("Cannot configure SPI CS GPIO");
+		return err;
+	}
+
+	err = paw32xx_init_irq(dev);
+	if (err) {
+				LOG_ERR("paw32xx_init_irq error");
+		return err;
+	}
+
+	k_work_init_delayable(&data->init_work, paw32xx_async_init);
+
+	k_work_schedule(&data->init_work, K_MSEC(async_init_delay[data->async_init_step]));
+
+	// reg_write(dev,0x09, 0x5A);
+	// k_sleep(K_MSEC(2));
+	// reg_write(dev,0x02, 0x87);   // FTC3065
+	// k_sleep(K_MSEC(2));
+	// reg_write(dev,0x06, 0x87);   // FTC3065 1600cpi
+	// k_sleep(K_MSEC(2));
+	// reg_write(dev,0x0A, 0xA2); // disable sleep mode
+	// k_sleep(K_MSEC(2));
+	// reg_write(dev,0x09, 0x00);
+	// k_sleep(K_MSEC(2));
+
+	reg_write(dev,0x09, 0x5A);
+	k_sleep(K_MSEC(2));
+	//reg_write(dev,0x26, 0x34);   // 2wire
+	//reg_write(dev,0x4B, 0x04);   // Low Voltage
+	//reg_write(dev,0x05, 0xA0);   // None Sleep 기본보다 전원 덜먹으나 6미리암페어에서서 떨어지지 않음
+	//reg_write(dev,0x05, 0x1C);   // 11100 Sleep2  전원많이 먹음 14mA까지나옴 감도 약간 떨어짐 9미리암페어에서 떨어지지 않음음
+	reg_write(dev,0x05, 0xB8);     // 기본  전원 약간 덜먹고 기본 대기시 1300미리암페어 슬립시 더 올라감 
+	//슬립설정없을때 0xB8임 			 
+	k_sleep(K_MSEC(2));
+	reg_write(dev,0x0D, 0x3F);      // CPI X 16~63 10진수 *38 하면 cpi 
+	k_sleep(K_MSEC(2));
+	reg_write(dev,0x0E, 0x3F);      // CPI Y
+	k_sleep(K_MSEC(2));
+	reg_write(dev,0x13, 0x01);      // IQC image quality
+	//reg_write(dev,0x14, 0x14);    // shutter
+	//reg_write(dev,0x17, 0x7F);    // Frame Avg
+	reg_write(dev,0x09, 0x00);
+
+
+	// pwaw3212_trigger_set 사용안되어 아래 넣어줌
+	// err = gpio_pin_interrupt_configure_dt(&config->irq_gpio,
+	// 					GPIO_INT_LEVEL_ACTIVE);
+	// async_init 안 set_interrupt 함수로 옮김
+	// enum sensor_channel chan;
+	// enum sensor_attribute attr;
+	// attr = PAW32XX_ATTR_CPI;
+	// struct sensor_value *val;
+	// chan =  SENSOR_CHAN_ALL;
+	// val=0x32;
+	// paw32xx_attr_set(dev,SENSOR_CHAN_ALL,PAW32XX_ATTR_CPI,val);
+	// paw32xx_attr_set(dev,SENSOR_CHAN_ALL,PAW32XX_ATTR_SLEEP_ENABLE,val);
+	// paw32xx_attr_set(dev,SENSOR_CHAN_ALL,PAW32XX_ATTR_SLEEP1_TIMEOUT,val);
+
+
+	return err;
+}
+
+static int paw32xx_sample_fetch(const struct device *dev, enum sensor_channel chan)
+{
+	//enum sensor_channel chan;
+	struct paw32xx_data *data = dev->data;
+   const struct paw32xx_config *config = dev->config;
+	uint8_t motion_status;
+	int err;
+
+	if (unlikely(chan != SENSOR_CHAN_ALL)) {
+		return -ENOTSUP;
+	}
+
+	if (unlikely(!data->ready)) {
+		LOG_INF("Device is not initialized yet");
+		return -EBUSY;
+	}
+
+    static int64_t dx = 0;
+    static int64_t dy = 0;
+
+#if CONFIG_PAW32XX_REPORT_INTERVAL_MIN > 0
+    static int64_t last_smp_time = 0;
+    static int64_t last_rpt_time = 0;
+    int64_t now = k_uptime_get();
+#endif
+
+	err = reg_read(dev, PAW32XX_REG_MOTION, &motion_status);
+	if (err) {
+		LOG_ERR("Cannot read motion");
+		return err;
+	}
+
+	if ((motion_status & PAW32XX_MOTION_STATUS_MOTION) != 0) {
+		uint8_t x_low;
+		uint8_t y_low;
+
+		if ((motion_status & PAW32XX_MOTION_STATUS_DXOVF) != 0) {
+			LOG_WRN("X delta overflowed");
+		}
+		if ((motion_status & PAW32XX_MOTION_STATUS_DYOVF) != 0) {
+			LOG_WRN("Y delta overflowed");
+		}
+
+		err = reg_read(dev, PAW32XX_REG_DELTA_X_LOW, &x_low);
+		if (err) {
+			LOG_ERR("Cannot read X delta");
+			return err;
+		}
+
+		err = reg_read(dev, PAW32XX_REG_DELTA_Y_LOW, &y_low);
+		if (err) {
+			LOG_ERR("Cannot read Y delta");
+			return err;
+		}
+
+
+		if (IS_ENABLED(CONFIG_PAW32XX_12_BIT_MODE)) {
+			uint8_t xy_high;
+
+			err = reg_read(dev, PAW32XX_REG_DELTA_XY_HIGH,
+				       &xy_high);
+			if (err) {
+				LOG_ERR("Cannot read XY delta high");
+				return err;
+			}
+
+			data->x = PAW32XX_DELTA_X(xy_high, x_low);
+			data->y = PAW32XX_DELTA_Y(xy_high, y_low);
+
+		} else {
+			data->x = (int8_t)x_low ;
+			data->y = (int8_t)y_low ;
+			// LOG_WRN("delta x : %d",x_low);
+			// LOG_WRN("data->x : %d",data->x);
+			// LOG_WRN("delta y : %d",y_low);
+			// LOG_WRN("data->y : %d",data->y);
+			// LOG_WRN("x/y: %d / %d", data->x, data->y);
+		}
+	} else {
+		data->x = 0;
+		data->y = 0;
+	}
+
+	if(zmk_usb_is_hid_ready()) //usb연결되면 최적으로 돔
+	{  if (data->x || data->y )
+		{
+			input_report_rel(dev, config->x_input_code, data->x , false, K_FOREVER);
+			input_report_rel(dev, config->y_input_code, data->y , true, K_FOREVER);
+			// input_report(dev, config->evt_type, config->x_input_code,  data->x, false, K_FOREVER);
+			// input_report(dev, config->evt_type, config->y_input_code,  data->y, true, K_FOREVER);
+		}
+	}
+	else
+	{
+#if CONFIG_PAW32XX_REPORT_INTERVAL_MIN > 0
+		// purge accumulated delta, if last sampled had not been reported on last report tick
+		if (now - last_smp_time >= CONFIG_PAW32XX_REPORT_INTERVAL_MIN) {
+			dx = 0;
+			dy = 0;
+		}
+		last_smp_time = now;
+#endif
+
+		// accumulate delta until report in next iteration
+		dx += data->x;
+		dy += data->y;
+
+#if CONFIG_PAW32XX_REPORT_INTERVAL_MIN > 0
+		// strict to report inerval
+		if (now - last_rpt_time < CONFIG_PAW32XX_REPORT_INTERVAL_MIN) {
+		return 0;
+		}
+#endif
+
+		//fetch report value pmw3610 보고 추가함 있어야 마우스 움직이나 빠른 움직임에서 딜레이로 멈춰버림림
+		// int16_t rx = dx*.5;
+		// int16_t ry = dy*.5;
+		int16_t rx = (int16_t)CLAMP(dx , INT16_MIN, INT16_MAX) * .5;
+		int16_t ry = (int16_t)CLAMP(dy , INT16_MIN, INT16_MAX) * .5;
+		bool have_x = rx != 0;
+		bool have_y = ry != 0;
+	
+		if (have_x || have_y) {
+#if CONFIG_PAW32XX_REPORT_INTERVAL_MIN > 0
+			last_rpt_time = now;
+			//bool usb_status = zmk_usb_is_hid_ready();
+			//LOG_WRN("IV:%d ,dx/dy : x /y %lld / %lld  :  %d , %d",usb_status, dx, dy, data->x,data->y);
+#endif
+			dx = 0;
+			dy = 0;
+			if (have_x) {
+					input_report(dev, config->evt_type, config->x_input_code, rx, !have_y, K_NO_WAIT);
+			}
+			if (have_y) {
+					input_report(dev, config->evt_type, config->y_input_code, ry, true, K_NO_WAIT);
+			}
+		}
+	}
+	//LOG_INF("PAW32XX sample fetch AAA");
+	return err;
+}
+
+static int paw32xx_channel_get(const struct device *dev, enum sensor_channel chan,
+			       struct sensor_value *val)
+{
+	struct paw32xx_data *data = dev->data;
+		LOG_INF("paw32xx_channel_get AAAA");
+
+	if (unlikely(!data->ready)) {
+		LOG_INF("Device is not initialized yet");
+		return -EBUSY;
+	}
+
+	switch (chan) {
+	case SENSOR_CHAN_POS_DX:
+		val->val1 = data->x;
+		val->val2 = 0;
+		break;
+
+	case SENSOR_CHAN_POS_DY:
+		val->val1 = data->y;
+		val->val2 = 0;
+		break;
+
+	default:
+		return -ENOTSUP;
+	}
+
+	return 0;
+}
+
+static int paw32xx_trigger_set(const struct device *dev,
+			       const struct sensor_trigger *trig,
+			       sensor_trigger_handler_t handler)
+{
+	struct paw32xx_data *data = dev->data;
+	const struct paw32xx_config *config = dev->config;
+	int err;
+	
+	LOG_INF("paw32xx_trigger_set AAAA");
+
+	if (unlikely(trig->type != SENSOR_TRIG_DATA_READY)) {
+		return -ENOTSUP;
+	}
+
+	if (unlikely(trig->chan != SENSOR_CHAN_ALL)) {
+		return -ENOTSUP;
+	}
+
+	if (unlikely(!data->ready)) {
+		LOG_INF("Device is not initialized yet");
+		return -EBUSY;
+	}
+
+	k_spinlock_key_t key = k_spin_lock(&data->lock);
+
+	if (handler) {
+		err = gpio_pin_interrupt_configure_dt(&config->irq_gpio,
+						      GPIO_INT_LEVEL_ACTIVE);
+	} else {
+		err = gpio_pin_interrupt_configure_dt(&config->irq_gpio,
+						      GPIO_INT_DISABLE);
+	}
+
+	if (!err) {
+		data->data_ready_handler = handler;
+	}
+
+	k_spin_unlock(&data->lock, key);
+
+	return err;
+}
+
+static int paw32xx_attr_set(const struct device *dev, enum sensor_channel chan,
+			    enum sensor_attribute attr,
+			    const struct sensor_value *val)
+{
+	struct paw32xx_data *data = dev->data;
+	int err;
+
+	if (unlikely(chan != SENSOR_CHAN_ALL)) {
+		return -ENOTSUP;
+	}
+
+	if (unlikely(!data->ready)) {
+		LOG_INF("Device is not initialized yet");
+		return -EBUSY;
+	}
+
+	switch ((uint32_t)attr) {
+	case PAW32XX_ATTR_CPI:
+		err = update_cpi(dev, PAW32XX_SVALUE_TO_CPI(*val));
+		break;
+
+	case PAW32XX_ATTR_SLEEP_ENABLE:
+		err = toggle_sleep_modes(dev,
+					 PAW32XX_REG_OPERATION_MODE,
+					 PAW32XX_REG_CONFIGURATION,
+					 PAW32XX_SVALUE_TO_BOOL(*val));
+		break;
+
+	case PAW32XX_ATTR_SLEEP1_TIMEOUT:
+		err = update_sleep_timeout(dev,
+					   PAW32XX_REG_SLEEP1,
+					   PAW32XX_SVALUE_TO_TIME(*val));
+		break;
+
+	case PAW32XX_ATTR_SLEEP2_TIMEOUT:
+		err = update_sleep_timeout(dev,
+					   PAW32XX_REG_SLEEP2,
+					   PAW32XX_SVALUE_TO_TIME(*val));
+		break;
+
+	case PAW32XX_ATTR_SLEEP3_TIMEOUT:
+		err = update_sleep_timeout(dev,
+					   PAW32XX_REG_SLEEP3,
+					   PAW32XX_SVALUE_TO_TIME(*val));
+		break;
+
+	case PAW32XX_ATTR_SLEEP1_SAMPLE_TIME:
+		err = update_sample_time(dev,
+					 PAW32XX_REG_SLEEP1,
+					 PAW32XX_SVALUE_TO_TIME(*val));
+		break;
+
+	case PAW32XX_ATTR_SLEEP2_SAMPLE_TIME:
+		err = update_sample_time(dev,
+					 PAW32XX_REG_SLEEP2,
+					 PAW32XX_SVALUE_TO_TIME(*val));
+		break;
+
+	case PAW32XX_ATTR_SLEEP3_SAMPLE_TIME:
+		err = update_sample_time(dev,
+					 PAW32XX_REG_SLEEP3,
+					 PAW32XX_SVALUE_TO_TIME(*val));
+		break;
+
+	default:
+		LOG_ERR("Unknown attribute");
+		return -ENOTSUP;
+	}
+
+	return err;
+}
+
+static const struct sensor_driver_api paw32xx_driver_api = {
+	.sample_fetch = paw32xx_sample_fetch,
+	.channel_get  = paw32xx_channel_get,
+	.trigger_set  = paw32xx_trigger_set,
+	.attr_set     = paw32xx_attr_set,
+};
+
+
+
+#define PAW32XX_DEFINE(n)                                               \
+	static struct paw32xx_data data##n;                                  \
+	static const struct paw32xx_config config##n = {                     \
+		.irq_gpio = GPIO_DT_SPEC_INST_GET(n, irq_gpios),                  \
+		.bus = {                                                          \
+			.bus = DEVICE_DT_GET(DT_INST_BUS(n)),                          \
+			.config = {                                                    \
+				.frequency = DT_INST_PROP(n,                                \
+							  spi_max_frequency),                              \
+				.operation = SPI_OP_MODE_MASTER |SPI_WORD_SET(8) |          \
+					     SPI_TRANSFER_MSB |                                  \
+					     SPI_MODE_CPOL | SPI_MODE_CPHA,                      \
+				.slave = DT_INST_REG_ADDR(n),                               \
+			},                                                             \
+		},                                                                \
+		.cpi = DT_PROP(DT_DRV_INST(n), cpi),                              \
+		.evt_type = DT_PROP(DT_DRV_INST(n), evt_type),                    \
+		.x_input_code = DT_PROP(DT_DRV_INST(n), x_input_code),            \
+		.y_input_code = DT_PROP(DT_DRV_INST(n), y_input_code),            \
+		.force_awake = DT_PROP(DT_DRV_INST(n), force_awake),              \
+		.cs_gpio = SPI_CS_GPIOS_DT_SPEC_GET(DT_DRV_INST(n)),              \
+		};                                                                \
+	DEVICE_DT_INST_DEFINE(n, paw32xx_init, NULL, &data##n, &config##n,   \
+			      POST_KERNEL, CONFIG_SENSOR_INIT_PRIORITY,                \
+			      &paw32xx_driver_api);
+DT_INST_FOREACH_STATUS_OKAY(PAW32XX_DEFINE)
+
+
+// 3610용 보고 아래 추가함
+// #define GET_PAW32XX_DEV(node_id) DEVICE_DT_GET(node_id),
+//
+// static const struct device *paw32xx_devs[] = {
+//     DT_FOREACH_STATUS_OKAY(pixart_paw32xx, GET_PAW32XX_DEV)
+// };
+//
+// static int on_activity_state(const zmk_event_t *eh) {
+//     struct zmk_activity_state_changed *state_ev = as_zmk_activity_state_changed(eh);
+// 		enum sensor_channel chan;
+// 		chan =  SENSOR_CHAN_ALL;
+// 	 if (!state_ev) {
+//         LOG_WRN("NO EVENT, leaving early");
+//         return 0;
+//     }
+//     bool enable = state_ev->state == ZMK_ACTIVITY_ACTIVE ? 1 : 0;
+//     for (size_t i = 0; i < ARRAY_SIZE(paw32xx_devs); i++) {
+//         //pmw3610_set_performance(paw32xx_devs[i], enable);
+// 		 for(int i=0;i<1;i++){
+// 			//paw32xx_sample_fetch(paw32xx_devs[i],chan);
+// 			k_busy_wait(T_SWX);
+// 			k_busy_wait(T_SWX);
+// 		 }
+// 		   LOG_INF("setperformance AAA");
+//     }
+//     return 0;
+// }
+//
+// ZMK_LISTENER(zmk_paw32xx_idle_sleeper, on_activity_state);
+// ZMK_SUBSCRIPTION(zmk_paw32xx_idle_sleeper, zmk_activity_state_changed);
