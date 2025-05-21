@@ -88,8 +88,8 @@ LOG_MODULE_REGISTER(paw32xx, CONFIG_PAW32XX_LOG_LEVEL);
 #define PAW32XX_DELTA_Y(xy_high, y_low)	expand_s12((((xy_high) & 0x0F) << 8) | (y_low))
 
 /* Sensor identification values */
-#define PAW32XX_PRODUCT_ID		0x30  //paw32xx 
-//#define PAW32XX_PRODUCT_ID		0x61    //fct3065
+//#define PAW32XX_PRODUCT_ID		0x30  //paw32xx 
+#define PAW32XX_PRODUCT_ID		0x61    //fct3065
 
 /* Write protect magic */
 #define PAW32XX_WPMAGIC			0x5A
@@ -145,8 +145,6 @@ static int paw32xx_async_init_power_up(const struct device *dev);
 static int paw32xx_async_init_verify_id(const struct device *dev);
 static int paw32xx_async_init_configure(const struct device *dev);
 static int paw32xx_sample_fetch(const struct device *dev, enum sensor_channel chan);
-
-
 
 static int (* const async_init_fn[ASYNC_INIT_STEP_COUNT])(const struct device *dev) = {
 	[ASYNC_INIT_STEP_POWER_UP]  = paw32xx_async_init_power_up,
@@ -266,45 +264,6 @@ static int reg_write(const struct device *dev, uint8_t reg, uint8_t val)
 	return 0;
 }
 
-static int update_cpi(const struct device *dev, uint32_t cpi)
-{
-	//LOG_WRN("update_cpi AAAAAA");
-	int err;
-	if ((cpi > PAW32XX_CPI_MAX) || (cpi < PAW32XX_CPI_MIN)) {
-		LOG_ERR("CPI %" PRIu32 " out of range", cpi);
-		return -EINVAL;
-	}
-
-	uint8_t regval = cpi / PAW32XX_CPI_STEP;
-
-	LOG_WRN("Set CPI: %u (requested: %u, reg:0x%" PRIx8 ")",
-		regval * PAW32XX_CPI_STEP, cpi, regval);
-
-	err = reg_write(dev, PAW32XX_REG_WRITE_PROTECT, PAW32XX_WPMAGIC);
-	if (err) {
-		LOG_ERR("Cannot disable write protect");
-		return err;
-	}
-
-	err = reg_write(dev, PAW32XX_REG_CPI_X, regval);
-	if (err) {
-		LOG_ERR("Failed to change x CPI");
-		return err;
-	}
-
-	err = reg_write(dev, PAW32XX_REG_CPI_Y, regval);
-	if (err) {
-		LOG_ERR("Failed to change y CPI");
-		return err;
-	}
-
-	err = reg_write(dev, PAW32XX_REG_WRITE_PROTECT, 0);
-	if (err) {
-		LOG_ERR("Cannot enable write protect");
-	}
-
-	return err;
-}
 
 static int update_sleep_timeout(const struct device *dev, uint8_t reg_addr,
 				uint32_t timeout_ms)
@@ -535,21 +494,11 @@ static void irq_handler(const struct device *gpiob, struct gpio_callback *cb,
 			uint32_t pins)
 {
 	//LOG_WRN("IRQ Handler AAAAAA");
-	//int err;
+
 	struct paw32xx_data *data = CONTAINER_OF(cb, struct paw32xx_data,
 						 irq_gpio_cb);
 	const struct device *dev = data->dev;
-	//const struct paw32xx_config *config = dev->config;
 
-	// err = gpio_pin_interrupt_configure_dt(&config->irq_gpio,
-	// 				      	      GPIO_INT_LEVEL_ACTIVE);
-	// // err = gpio_pin_interrupt_configure_dt(&config->irq_gpio,
-	// // 				      GPIO_INT_DISABLE);
-	// if (unlikely(err)) {
-	// 	LOG_ERR("Cannot disable IRQ");
-	// 	k_panic();
-	// }
- 
 	//위에 주석처리하고 irq 인터럽트 함수로 넣어줌
 	set_interrupt(dev, false);
 	
@@ -559,49 +508,15 @@ static void irq_handler(const struct device *gpiob, struct gpio_callback *cb,
 static void trigger_handler(struct k_work *work)
 {
 	//LOG_WRN("Trigger Handler AAAAAA");
-
-	//sensor_trigger_handler_t handler;
-	//int err = 0;
 	struct paw32xx_data *data = CONTAINER_OF(work, struct paw32xx_data,
 						 trigger_handler_work);
 	const struct device *dev = data->dev;
-	//const struct paw32xx_config *config = dev->config;
 	
 	//추가해 주고 아래는 주석처리함 있으면 다운됨 
 	enum sensor_channel chan;
 	chan =  SENSOR_CHAN_ALL;
 	paw32xx_sample_fetch(dev,chan);
 	set_interrupt(dev, true);
-
-   /*
-	// k_spinlock_key_t key = k_spin_lock(&data->lock);
-
-	// handler = data->data_ready_handler;
-	// k_spin_unlock(&data->lock, key);
-	// if (!handler) {
-	// 	return;
-	// }
-
-	// struct sensor_trigger trig = {
-	// 	.type = SENSOR_TRIG_DATA_READY,
-	// 	.chan = SENSOR_CHAN_ALL,
-	// };
-
-	// handler(dev, &trig);
-
-	// key = k_spin_lock(&data->lock);
-	// if (data->data_ready_handler) {
-	// 	err = gpio_pin_interrupt_configure_dt(&config->irq_gpio,
-	// 					      GPIO_INT_LEVEL_ACTIVE);
-	// 	LOG_WRN("Trigger Handler gpi interrupt config AAA");
-	// }
-	// k_spin_unlock(&data->lock, key);
-
-	// if (unlikely(err)) {
-	// 	LOG_ERR("Cannot re-enable IRQ");
-	// 	k_panic();
-	// }
-	*/
 }
 
 
@@ -637,30 +552,19 @@ static int paw32xx_async_init_configure(const struct device *dev)
 {
 	int err;
 
-	err = reg_write(dev, PAW32XX_REG_WRITE_PROTECT, PAW32XX_WPMAGIC);
-	if (!err) {
-		uint8_t mouse_option = 0;
-
-		if (IS_ENABLED(CONFIG_PAW32XX_ORIENTATION_90)) {
-			mouse_option |= PAW32XX_MOUSE_OPT_XY_SWAP |
-					PAW32XX_MOUSE_OPT_Y_INV;
-		} else if (IS_ENABLED(CONFIG_PAW32XX_ORIENTATION_180)) {
-			mouse_option |= PAW32XX_MOUSE_OPT_Y_INV |
-					PAW32XX_MOUSE_OPT_X_INV;
-		} else if (IS_ENABLED(CONFIG_PAW32XX_ORIENTATION_270)) {
-			mouse_option |= PAW32XX_MOUSE_OPT_XY_SWAP |
-					PAW32XX_MOUSE_OPT_X_INV;		}
-
-		if (IS_ENABLED(CONFIG_PAW32XX_12_BIT_MODE)) {
-			mouse_option |= PAW32XX_MOUSE_OPT_12BITMODE;
+	 err = reg_write(dev, PAW32XX_REG_WRITE_PROTECT, PAW32XX_WPMAGIC);
+	 if (!err) {
+			// k_sleep(K_MSEC(2));
+			// reg_write(dev,0x02, 0x87);  // 
+			k_sleep(K_MSEC(5));
+			reg_write(dev,0x06, 0x87);   // FTC3065 1600cpi
+			k_sleep(K_MSEC(5));
+			// reg_write(dev,0x0A, 0xA2); // disable sleep mode
+			// k_sleep(K_MSEC(2));
 		}
-
-		err = reg_write(dev, PAW32XX_REG_MOUSE_OPTION,
-				mouse_option);
-	}
-	if (!err) {
-		err = reg_write(dev, PAW32XX_REG_WRITE_PROTECT, 0);
-	}
+	 if (!err) {
+	 	err = reg_write(dev, PAW32XX_REG_WRITE_PROTECT, 0);
+	 }
 
 	return err;
 }
@@ -691,7 +595,6 @@ static void paw32xx_async_init(struct k_work *work)
 		}
 	}
 }
-
 
 static int paw32xx_init_irq(const struct device *dev)
 {
@@ -764,51 +667,6 @@ static int paw32xx_init(const struct device *dev)
 	k_work_init_delayable(&data->init_work, paw32xx_async_init);
 
 	k_work_schedule(&data->init_work, K_MSEC(async_init_delay[data->async_init_step]));
-
-	// reg_write(dev,0x09, 0x5A);
-	// k_sleep(K_MSEC(2));
-	// reg_write(dev,0x02, 0x87);   // FTC3065
-	// k_sleep(K_MSEC(2));
-	// reg_write(dev,0x06, 0x87);   // FTC3065 1600cpi
-	// k_sleep(K_MSEC(2));
-	// reg_write(dev,0x0A, 0xA2); // disable sleep mode
-	// k_sleep(K_MSEC(2));
-	// reg_write(dev,0x09, 0x00);
-	// k_sleep(K_MSEC(2));
-
-	reg_write(dev,0x09, 0x5A);
-	k_sleep(K_MSEC(2));
-	//reg_write(dev,0x26, 0x34);   // 2wire
-	//reg_write(dev,0x4B, 0x04);   // Low Voltage
-	//reg_write(dev,0x05, 0xA0);   // None Sleep 기본보다 전원 덜먹으나 6미리암페어에서서 떨어지지 않음
-	//reg_write(dev,0x05, 0x1C);   // 11100 Sleep2  전원많이 먹음 14mA까지나옴 감도 약간 떨어짐 9미리암페어에서 떨어지지 않음음
-	reg_write(dev,0x05, 0xB8);     // 기본  전원 약간 덜먹고 기본 대기시 1300미리암페어 슬립시 더 올라감 
-	//슬립설정없을때 0xB8임 			 
-	k_sleep(K_MSEC(2));
-	reg_write(dev,0x0D, 0x3F);      // CPI X 16~63 10진수 *38 하면 cpi 
-	k_sleep(K_MSEC(2));
-	reg_write(dev,0x0E, 0x3F);      // CPI Y
-	k_sleep(K_MSEC(2));
-	reg_write(dev,0x13, 0x01);      // IQC image quality
-	//reg_write(dev,0x14, 0x14);    // shutter
-	//reg_write(dev,0x17, 0x7F);    // Frame Avg
-	reg_write(dev,0x09, 0x00);
-
-
-	// pwaw3212_trigger_set 사용안되어 아래 넣어줌
-	// err = gpio_pin_interrupt_configure_dt(&config->irq_gpio,
-	// 					GPIO_INT_LEVEL_ACTIVE);
-	// async_init 안 set_interrupt 함수로 옮김
-	// enum sensor_channel chan;
-	// enum sensor_attribute attr;
-	// attr = PAW32XX_ATTR_CPI;
-	// struct sensor_value *val;
-	// chan =  SENSOR_CHAN_ALL;
-	// val=0x32;
-	// paw32xx_attr_set(dev,SENSOR_CHAN_ALL,PAW32XX_ATTR_CPI,val);
-	// paw32xx_attr_set(dev,SENSOR_CHAN_ALL,PAW32XX_ATTR_SLEEP_ENABLE,val);
-	// paw32xx_attr_set(dev,SENSOR_CHAN_ALL,PAW32XX_ATTR_SLEEP1_TIMEOUT,val);
-
 
 	return err;
 }
@@ -897,12 +755,12 @@ static int paw32xx_sample_fetch(const struct device *dev, enum sensor_channel ch
 	}
 
 	if(zmk_usb_is_hid_ready()) //usb연결되면 최적으로 돔
-	{  if (data->x || data->y )
+	{  if ( data->x || data->y ) 
 		{
-			input_report_rel(dev, config->x_input_code, data->x , false, K_FOREVER);
-			input_report_rel(dev, config->y_input_code, data->y , true, K_FOREVER);
+			input_report_rel(dev, config->x_input_code,  data->x , false, K_FOREVER);
+			input_report_rel(dev, config->y_input_code, -data->y , true, K_FOREVER);
 			// input_report(dev, config->evt_type, config->x_input_code,  data->x, false, K_FOREVER);
-			// input_report(dev, config->evt_type, config->y_input_code,  data->y, true, K_FOREVER);
+			// input_report(dev, config->evt_type, config->y_input_code,  data->y, true, K_FOREVER);			
 		}
 	}
 	else
@@ -943,169 +801,23 @@ static int paw32xx_sample_fetch(const struct device *dev, enum sensor_channel ch
 #endif
 			dx = 0;
 			dy = 0;
-			if (have_x) {
-					input_report(dev, config->evt_type, config->x_input_code, rx, !have_y, K_NO_WAIT);
+			if (have_x || have_y ) {
+					 input_report(dev, config->evt_type, config->x_input_code, rx, !have_y, K_NO_WAIT);
+			 		 input_report(dev, config->evt_type, config->y_input_code, -ry, true, K_NO_WAIT);
 			}
-			if (have_y) {
-					input_report(dev, config->evt_type, config->y_input_code, ry, true, K_NO_WAIT);
-			}
+			// if (have_x) {
+			// 		// input_report(dev, config->evt_type, config->x_input_code, rx, !have_y, K_NO_WAIT);
+			// 		input_report_rel(dev, config->x_input_code, rx, !have_y, K_NO_WAIT);
+			// }
+			// if (have_y) {
+			// 		// input_report(dev, config->evt_type, config->y_input_code, -ry, true, K_FOREVER);
+			// 		input_report_rel(dev, config->y_input_code, -ry, true, K_NO_WAIT);
+			// }
 		}
 	}
 	//LOG_INF("PAW32XX sample fetch AAA");
 	return err;
 }
-
-static int paw32xx_channel_get(const struct device *dev, enum sensor_channel chan,
-			       struct sensor_value *val)
-{
-	struct paw32xx_data *data = dev->data;
-		LOG_INF("paw32xx_channel_get AAAA");
-
-	if (unlikely(!data->ready)) {
-		LOG_INF("Device is not initialized yet");
-		return -EBUSY;
-	}
-
-	switch (chan) {
-	case SENSOR_CHAN_POS_DX:
-		val->val1 = data->x;
-		val->val2 = 0;
-		break;
-
-	case SENSOR_CHAN_POS_DY:
-		val->val1 = data->y;
-		val->val2 = 0;
-		break;
-
-	default:
-		return -ENOTSUP;
-	}
-
-	return 0;
-}
-
-static int paw32xx_trigger_set(const struct device *dev,
-			       const struct sensor_trigger *trig,
-			       sensor_trigger_handler_t handler)
-{
-	struct paw32xx_data *data = dev->data;
-	const struct paw32xx_config *config = dev->config;
-	int err;
-	
-	LOG_INF("paw32xx_trigger_set AAAA");
-
-	if (unlikely(trig->type != SENSOR_TRIG_DATA_READY)) {
-		return -ENOTSUP;
-	}
-
-	if (unlikely(trig->chan != SENSOR_CHAN_ALL)) {
-		return -ENOTSUP;
-	}
-
-	if (unlikely(!data->ready)) {
-		LOG_INF("Device is not initialized yet");
-		return -EBUSY;
-	}
-
-	k_spinlock_key_t key = k_spin_lock(&data->lock);
-
-	if (handler) {
-		err = gpio_pin_interrupt_configure_dt(&config->irq_gpio,
-						      GPIO_INT_LEVEL_ACTIVE);
-	} else {
-		err = gpio_pin_interrupt_configure_dt(&config->irq_gpio,
-						      GPIO_INT_DISABLE);
-	}
-
-	if (!err) {
-		data->data_ready_handler = handler;
-	}
-
-	k_spin_unlock(&data->lock, key);
-
-	return err;
-}
-
-static int paw32xx_attr_set(const struct device *dev, enum sensor_channel chan,
-			    enum sensor_attribute attr,
-			    const struct sensor_value *val)
-{
-	struct paw32xx_data *data = dev->data;
-	int err;
-
-	if (unlikely(chan != SENSOR_CHAN_ALL)) {
-		return -ENOTSUP;
-	}
-
-	if (unlikely(!data->ready)) {
-		LOG_INF("Device is not initialized yet");
-		return -EBUSY;
-	}
-
-	switch ((uint32_t)attr) {
-	case PAW32XX_ATTR_CPI:
-		err = update_cpi(dev, PAW32XX_SVALUE_TO_CPI(*val));
-		break;
-
-	case PAW32XX_ATTR_SLEEP_ENABLE:
-		err = toggle_sleep_modes(dev,
-					 PAW32XX_REG_OPERATION_MODE,
-					 PAW32XX_REG_CONFIGURATION,
-					 PAW32XX_SVALUE_TO_BOOL(*val));
-		break;
-
-	case PAW32XX_ATTR_SLEEP1_TIMEOUT:
-		err = update_sleep_timeout(dev,
-					   PAW32XX_REG_SLEEP1,
-					   PAW32XX_SVALUE_TO_TIME(*val));
-		break;
-
-	case PAW32XX_ATTR_SLEEP2_TIMEOUT:
-		err = update_sleep_timeout(dev,
-					   PAW32XX_REG_SLEEP2,
-					   PAW32XX_SVALUE_TO_TIME(*val));
-		break;
-
-	case PAW32XX_ATTR_SLEEP3_TIMEOUT:
-		err = update_sleep_timeout(dev,
-					   PAW32XX_REG_SLEEP3,
-					   PAW32XX_SVALUE_TO_TIME(*val));
-		break;
-
-	case PAW32XX_ATTR_SLEEP1_SAMPLE_TIME:
-		err = update_sample_time(dev,
-					 PAW32XX_REG_SLEEP1,
-					 PAW32XX_SVALUE_TO_TIME(*val));
-		break;
-
-	case PAW32XX_ATTR_SLEEP2_SAMPLE_TIME:
-		err = update_sample_time(dev,
-					 PAW32XX_REG_SLEEP2,
-					 PAW32XX_SVALUE_TO_TIME(*val));
-		break;
-
-	case PAW32XX_ATTR_SLEEP3_SAMPLE_TIME:
-		err = update_sample_time(dev,
-					 PAW32XX_REG_SLEEP3,
-					 PAW32XX_SVALUE_TO_TIME(*val));
-		break;
-
-	default:
-		LOG_ERR("Unknown attribute");
-		return -ENOTSUP;
-	}
-
-	return err;
-}
-
-static const struct sensor_driver_api paw32xx_driver_api = {
-	.sample_fetch = paw32xx_sample_fetch,
-	.channel_get  = paw32xx_channel_get,
-	.trigger_set  = paw32xx_trigger_set,
-	.attr_set     = paw32xx_attr_set,
-};
-
-
 
 #define PAW32XX_DEFINE(n)                                               \
 	static struct paw32xx_data data##n;                                  \
@@ -1131,37 +843,5 @@ static const struct sensor_driver_api paw32xx_driver_api = {
 		};                                                                \
 	DEVICE_DT_INST_DEFINE(n, paw32xx_init, NULL, &data##n, &config##n,   \
 			      POST_KERNEL, CONFIG_SENSOR_INIT_PRIORITY,                \
-			      &paw32xx_driver_api);
+			      NULL);
 DT_INST_FOREACH_STATUS_OKAY(PAW32XX_DEFINE)
-
-
-// 3610용 보고 아래 추가함
-// #define GET_PAW32XX_DEV(node_id) DEVICE_DT_GET(node_id),
-//
-// static const struct device *paw32xx_devs[] = {
-//     DT_FOREACH_STATUS_OKAY(pixart_paw32xx, GET_PAW32XX_DEV)
-// };
-//
-// static int on_activity_state(const zmk_event_t *eh) {
-//     struct zmk_activity_state_changed *state_ev = as_zmk_activity_state_changed(eh);
-// 		enum sensor_channel chan;
-// 		chan =  SENSOR_CHAN_ALL;
-// 	 if (!state_ev) {
-//         LOG_WRN("NO EVENT, leaving early");
-//         return 0;
-//     }
-//     bool enable = state_ev->state == ZMK_ACTIVITY_ACTIVE ? 1 : 0;
-//     for (size_t i = 0; i < ARRAY_SIZE(paw32xx_devs); i++) {
-//         //pmw3610_set_performance(paw32xx_devs[i], enable);
-// 		 for(int i=0;i<1;i++){
-// 			//paw32xx_sample_fetch(paw32xx_devs[i],chan);
-// 			k_busy_wait(T_SWX);
-// 			k_busy_wait(T_SWX);
-// 		 }
-// 		   LOG_INF("setperformance AAA");
-//     }
-//     return 0;
-// }
-//
-// ZMK_LISTENER(zmk_paw32xx_idle_sleeper, on_activity_state);
-// ZMK_SUBSCRIPTION(zmk_paw32xx_idle_sleeper, zmk_activity_state_changed);
